@@ -35,8 +35,13 @@ if (telegramBotToken && telegramGroupChatId) {
     console.warn('Warning: Telegram bot credentials not configured. Telegram authentication will be disabled.');
 }
 
-const staticPath = path.join(__dirname,'dist');
-const publicPath = path.join(__dirname,'public');
+// Determine correct paths based on environment
+const staticPath = process.env.VERCEL 
+    ? path.join(process.cwd(), 'dist')
+    : path.join(__dirname, 'dist');
+const publicPath = process.env.VERCEL 
+    ? path.join(process.cwd(), 'server', 'public')
+    : path.join(__dirname, 'public');
 
 
 if (!apiKey) {
@@ -492,108 +497,115 @@ app.get('/service-worker.js', (req, res) => {
 app.use('/public', express.static(publicPath));
 app.use(express.static(staticPath));
 
-// Start the HTTP server
-const server = app.listen(port, () => {
-    console.log(`Server listening on port ${port}`);
-    console.log(`HTTP proxy active on /api-proxy/**`);
-    console.log(`WebSocket proxy active on /api-proxy/**`);
-});
+// Start the HTTP server only if not in Vercel environment
+if (!process.env.VERCEL) {
+    const server = app.listen(port, () => {
+        console.log(`Server listening on port ${port}`);
+        console.log(`HTTP proxy active on /api-proxy/**`);
+        console.log(`WebSocket proxy active on /api-proxy/**`);
+    });
 
-// Create WebSocket server and attach it to the HTTP server
-const wss = new WebSocket.Server({ noServer: true });
+    // Create WebSocket server and attach it to the HTTP server
+    const wss = new WebSocket.Server({ noServer: true });
 
-server.on('upgrade', (request, socket, head) => {
-    const requestUrl = new URL(request.url, `http://${request.headers.host}`);
-    const pathname = requestUrl.pathname;
+    server.on('upgrade', (request, socket, head) => {
+        const requestUrl = new URL(request.url, `http://${request.headers.host}`);
+        const pathname = requestUrl.pathname;
 
-    if (pathname.startsWith('/api-proxy/')) {
-        if (!apiKey) {
-            console.error("WebSocket proxy: API key not configured. Closing connection.");
-            socket.destroy();
-            return;
-        }
+        if (pathname.startsWith('/api-proxy/')) {
+            if (!apiKey) {
+                console.error("WebSocket proxy: API key not configured. Closing connection.");
+                socket.destroy();
+                return;
+            }
 
-        wss.handleUpgrade(request, socket, head, (clientWs) => {
-            console.log('Client WebSocket connected to proxy for path:', pathname);
+            wss.handleUpgrade(request, socket, head, (clientWs) => {
+                console.log('Client WebSocket connected to proxy for path:', pathname);
 
-            const targetPathSegment = pathname.substring('/api-proxy'.length);
-            const clientQuery = new URLSearchParams(requestUrl.search);
-            clientQuery.set('key', apiKey);
-            const targetGeminiWsUrl = `${externalWsBaseUrl}${targetPathSegment}?${clientQuery.toString()}`;
-            console.log(`Attempting to connect to target WebSocket: ${targetGeminiWsUrl}`);
+                const targetPathSegment = pathname.substring('/api-proxy'.length);
+                const clientQuery = new URLSearchParams(requestUrl.search);
+                clientQuery.set('key', apiKey);
+                const targetGeminiWsUrl = `${externalWsBaseUrl}${targetPathSegment}?${clientQuery.toString()}`;
+                console.log(`Attempting to connect to target WebSocket: ${targetGeminiWsUrl}`);
 
-            const geminiWs = new WebSocket(targetGeminiWsUrl, {
-                protocol: request.headers['sec-websocket-protocol'],
-            });
+                const geminiWs = new WebSocket(targetGeminiWsUrl, {
+                    protocol: request.headers['sec-websocket-protocol'],
+                });
 
-            const messageQueue = [];
+                const messageQueue = [];
 
-            geminiWs.on('open', () => {
-                console.log('Proxy connected to Gemini WebSocket');
-                // Send any queued messages
-                while (messageQueue.length > 0) {
-                    const message = messageQueue.shift();
-                    if (geminiWs.readyState === WebSocket.OPEN) {
-                        // console.log('Sending queued message from client -> Gemini');
-                        geminiWs.send(message);
-                    } else {
-                        // Should not happen if we are in 'open' event, but good for safety
-                        console.warn('Gemini WebSocket not open when trying to send queued message. Re-queuing.');
-                        messageQueue.unshift(message); // Add it back to the front
-                        break; // Stop processing queue for now
+                geminiWs.on('open', () => {
+                    console.log('Proxy connected to Gemini WebSocket');
+                    // Send any queued messages
+                    while (messageQueue.length > 0) {
+                        const message = messageQueue.shift();
+                        if (geminiWs.readyState === WebSocket.OPEN) {
+                            // console.log('Sending queued message from client -> Gemini');
+                            geminiWs.send(message);
+                        } else {
+                            // Should not happen if we are in 'open' event, but good for safety
+                            console.warn('Gemini WebSocket not open when trying to send queued message. Re-queuing.');
+                            messageQueue.unshift(message); // Add it back to the front
+                            break; // Stop processing queue for now
+                        }
                     }
-                }
-            });
+                });
 
-            geminiWs.on('message', (message) => {
-                // console.log('Message from Gemini -> client');
-                if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(message);
-                }
-            });
+                geminiWs.on('message', (message) => {
+                    // console.log('Message from Gemini -> client');
+                    if (clientWs.readyState === WebSocket.OPEN) {
+                        clientWs.send(message);
+                    }
+                });
 
-            geminiWs.on('close', (code, reason) => {
-                console.log(`Gemini WebSocket closed: ${code} ${reason.toString()}`);
-                if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
-                    clientWs.close(code, reason.toString());
-                }
-            });
+                geminiWs.on('close', (code, reason) => {
+                    console.log(`Gemini WebSocket closed: ${code} ${reason.toString()}`);
+                    if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
+                        clientWs.close(code, reason.toString());
+                    }
+                });
 
-            geminiWs.on('error', (error) => {
-                console.error('Error on Gemini WebSocket connection:', error);
-                if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
-                    clientWs.close(1011, 'Upstream WebSocket error');
-                }
-            });
+                geminiWs.on('error', (error) => {
+                    console.error('Error on Gemini WebSocket connection:', error);
+                    if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
+                        clientWs.close(1011, 'Upstream WebSocket error');
+                    }
+                });
 
-            clientWs.on('message', (message) => {
-                if (geminiWs.readyState === WebSocket.OPEN) {
-                    // console.log('Message from client -> Gemini');
-                    geminiWs.send(message);
-                } else if (geminiWs.readyState === WebSocket.CONNECTING) {
-                    // console.log('Queueing message from client -> Gemini (Gemini still connecting)');
-                    messageQueue.push(message);
-                } else {
-                    console.warn('Client sent message but Gemini WebSocket is not open or connecting. Message dropped.');
-                }
-            });
+                clientWs.on('message', (message) => {
+                    if (geminiWs.readyState === WebSocket.OPEN) {
+                        // console.log('Message from client -> Gemini');
+                        geminiWs.send(message);
+                    } else if (geminiWs.readyState === WebSocket.CONNECTING) {
+                        // console.log('Queueing message from client -> Gemini (Gemini still connecting)');
+                        messageQueue.push(message);
+                    } else {
+                        console.warn('Client sent message but Gemini WebSocket is not open or connecting. Message dropped.');
+                    }
+                });
 
-            clientWs.on('close', (code, reason) => {
-                console.log(`Client WebSocket closed: ${code} ${reason.toString()}`);
-                if (geminiWs.readyState === WebSocket.OPEN || geminiWs.readyState === WebSocket.CONNECTING) {
-                    geminiWs.close(code, reason.toString());
-                }
-            });
+                clientWs.on('close', (code, reason) => {
+                    console.log(`Client WebSocket closed: ${code} ${reason.toString()}`);
+                    if (geminiWs.readyState === WebSocket.OPEN || geminiWs.readyState === WebSocket.CONNECTING) {
+                        geminiWs.close(code, reason.toString());
+                    }
+                });
 
-            clientWs.on('error', (error) => {
-                console.error('Error on client WebSocket connection:', error);
-                if (geminiWs.readyState === WebSocket.OPEN || geminiWs.readyState === WebSocket.CONNECTING) {
-                    geminiWs.close(1011, 'Client WebSocket error');
-                }
+                clientWs.on('error', (error) => {
+                    console.error('Error on client WebSocket connection:', error);
+                    if (geminiWs.readyState === WebSocket.OPEN || geminiWs.readyState === WebSocket.CONNECTING) {
+                        geminiWs.close(1011, 'Client WebSocket error');
+                    }
+                });
             });
-        });
-    } else {
-        console.log(`WebSocket upgrade request for non-proxy path: ${pathname}. Closing connection.`);
-        socket.destroy();
-    }
-});
+        } else {
+            console.log(`WebSocket upgrade request for non-proxy path: ${pathname}. Closing connection.`);
+            socket.destroy();
+        }
+    });
+} else {
+    console.log('Running in Vercel serverless environment');
+}
+
+// Export the app for Vercel
+module.exports = app;
